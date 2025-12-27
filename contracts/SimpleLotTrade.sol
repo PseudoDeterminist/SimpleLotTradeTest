@@ -200,11 +200,11 @@ contract SimpleLotTrade {
         uint256 orderCount;
     }
 
-    constructor(address tetcToken, address strn10kToken) {
+    constructor(address tetcToken, address tkn10kToken) {
         require(tetcToken != address(0), "zero TETC");
-        require(strn10kToken != address(0), "zero TKN10K");
+        require(tkn10kToken != address(0), "zero TKN10K");
         TETC = IERC20(tetcToken);
-        TKN10K = IERC20(strn10kToken);
+        TKN10K = IERC20(tkn10kToken);
         bestBuyTick = NONE;
         bestSellTick = NONE;
     }
@@ -240,7 +240,7 @@ contract SimpleLotTrade {
 
         // Refund remaining escrow
         if (o.isBuy) {
-            uint256 refund = uint256(o.lotsRemaining) * PriceTicks.price(o.tick);
+            uint256 refund = uint256(o.lotsRemaining) * o.price;
             require(TETC.transfer(msg.sender, refund), "TETC refund failed");
             buyLevels[o.tick].totalLots -= o.lotsRemaining;
         } else {

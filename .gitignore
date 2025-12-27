@@ -21,3 +21,6 @@ cache/
 out/
 .env
 .DS_Store
+
+# core-geth files
+chaindata/
