@@ -214,6 +214,7 @@ contract SimpleLotTrade {
 
     function placeBuy(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
+        require(!hasBestSell || bestSellTick > tick, "crossing sell book");
 
         uint256 cost = uint256(lots) * priceAtTick(tick);
 
@@ -226,6 +227,7 @@ contract SimpleLotTrade {
 
     function placeSell(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
+        require(!hasBestBuy || bestBuyTick < tick, "crossing buy book");
         
         // Escrow TKN10K lots in this contract (integer token)
         require(TKN10K.transferFrom(msg.sender, address(this), uint256(lots)), "TKN10K transferFrom failed");

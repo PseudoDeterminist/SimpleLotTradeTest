@@ -2,6 +2,8 @@
 
 "Lot Trade is a per-pair, gas-only, lot-based on-chain orderbook designed for atomic settlement and low state growth. It uses a disciplined tick grid, explicit maker/taker roles, and Fill-Or-Kill execution to avoid partial leftovers and bloat. The contract is intentionally not a retail convenience engine; it is a clean settlement market whose prints can anchor price discovery for layers above it." -- short summary
 
+Maker orders that would cross the book are rejected; crossing the spread requires explicit taker FOK calls.
+
 This project demonstrates a basic Lot Trading token pair, intended for the Ethereum Classic blockchain. It's especially suited for ETC because it's meant to trade at the speed of proof of work: Slowly but at high value.
 
 The tokens in this contract are generic test tokens, worth zero and always will be (They'll be given away freely to users who want to test on chain).
@@ -62,4 +64,3 @@ You see that the ticks are designed to have only four significant decimal digits
 This aids both in human readability and in eliminating dust-level "precision" in trying to fit prices exactly to the curve. We sacrifice that exactness for these benefits, and yet the curve still looks smooth at scale, as the plot shows.
 
 Traders don't get into petty price-difference wars between ticks, because those prices are unavailable by design. This means if a trader wants to set the new "best trade" they must be willing to lower the best price or raise the highest bid by a full half percent!
-
