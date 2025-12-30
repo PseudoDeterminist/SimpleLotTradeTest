@@ -21,9 +21,9 @@ interface IERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
 
-/* ===================== Packed Mantissa Table (464/decade) ===================== */
+/* ===================== Lot CLOB ===================== */
 
-library PriceTicks {
+contract SimpleLotTrade {
     // Tick range: -464*4 .. +464*4
     int256 private constant MIN_TICK = -2320;
     int256 private constant MAX_TICK =  2320;
@@ -68,6 +68,7 @@ library PriceTicks {
         9237  9283  9329  9375  9422  9469  9516  9563  9611  9659  9707  9755  9803  9852  9901  9950
     */
 
+    // Packed mantissa bytes
     bytes internal constant MANT =
         hex"03e803ed03f203f703fc04010406040b04100416041b04200425042b04300435"
         hex"043b04400445044b04500456045b04610466046c04720477047d04830489048e"
@@ -99,6 +100,11 @@ library PriceTicks {
         hex"2154217e21a921d421ff222a2256228122ad22d923062332235f238c23b923e7"
         hex"241524432471249f24ce24fd252c255b258b25bb25eb261b264b267c26ad26de";
 
+    // Precomputed order of magnitude factors (1e10 .. 1e19), big-endian uint256 words.
+    // Actual prices are mantissa * decade_factor, 1000 to 10000 times the factor.
+    // These are the limited range of decades needed for tick range -2320 to +2320
+    // This range was chosen for mathematical safety, and prices are not expected
+    //     to go anywhere near these extremes in practice.
     bytes internal constant DECADES =
         hex"00000000000000000000000000000000000000000000000000000002540be400"  // 1e10
         hex"000000000000000000000000000000000000000000000000000000174876e800"  // 1e11
@@ -110,32 +116,7 @@ library PriceTicks {
         hex"000000000000000000000000000000000000000000000000016345785d8a0000"  // 1e17
         hex"0000000000000000000000000000000000000000000000000de0b6b3a7640000"  // 1e18
         hex"0000000000000000000000000000000000000000000000008ac7230489e80000"; // 1e19
-    
-    function price(int256 tick) internal pure returns (uint256 result) {
-        require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
-    
-        uint256 t = uint256(tick - MIN_TICK); // safe because of require above
-        uint256 d = t / 464;                  // decade index
-        uint256 r = t % 464;                  // mantissa index
-    
-        uint256 i = r * 2;
-        uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
-    
-        // Copy DECADES to memory so we can reference it in assembly
-        bytes memory decadesData = DECADES;
-        uint256 factor;
-        assembly {
-            // decadesData pointer + 0x20 (skip length) + d*32 to pick the d-th 32-byte word
-            factor := mload(add(add(decadesData, 0x20), mul(d, 0x20)))
-        }
-    
-        result = factor * m;
-    }
-}
 
-/* ===================== Lot CLOB ===================== */
-
-contract SimpleLotTrade {
     IERC20 public immutable TETC;    // quote token (18 decimals)
     IERC20 public immutable TKN10K; // base token (0 decimals, integer lots)
 
@@ -157,7 +138,6 @@ contract SimpleLotTrade {
     struct Order {
         address owner;
         int256 tick;
-        uint256 price;
         uint256 lotsRemaining;
         bool isBuy;     // buy lots for TETC, or sell lots for TETC
         uint256 prev;
@@ -209,13 +189,33 @@ contract SimpleLotTrade {
         bestSellTick = NONE;
     }
 
+    function priceAtTick(int256 tick) public pure returns (uint256 result) {
+        require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
+    
+        uint256 t = uint256(tick - MIN_TICK); // safe because of require above
+        uint256 d = t / 464;                  // decade index
+        uint256 r = t % 464;                  // mantissa index
+    
+        uint256 i = r * 2;
+        uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
+    
+        // Copy DECADES to memory so we can reference it in assembly
+        bytes memory decadesData = DECADES;
+        uint256 factor;
+        assembly {
+            // decadesData pointer + 0x20 (skip length) + d*32 to pick the d-th 32-byte word
+            factor := mload(add(add(decadesData, 0x20), mul(d, 0x20)))
+        }
+    
+        result = factor * m;
+    }
+
     /* ---------- Maker Orders (escrow on placement) ---------- */
 
     function placeBuy(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
 
-        uint256 price = PriceTicks.price(tick);
-        uint256 cost = uint256(lots) * price;
+        uint256 cost = uint256(lots) * priceAtTick(tick);
 
         // Escrow TETC in this contract
         require(TETC.transferFrom(msg.sender, address(this), cost), "TETC transferFrom failed");
@@ -226,7 +226,7 @@ contract SimpleLotTrade {
 
     function placeSell(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
-
+        
         // Escrow TKN10K lots in this contract (integer token)
         require(TKN10K.transferFrom(msg.sender, address(this), uint256(lots)), "TKN10K transferFrom failed");
 
@@ -240,7 +240,7 @@ contract SimpleLotTrade {
 
         // Refund remaining escrow
         if (o.isBuy) {
-            uint256 refund = uint256(o.lotsRemaining) * o.price;
+            uint256 refund = uint256(o.lotsRemaining) * priceAtTick(o.tick);
             require(TETC.transfer(msg.sender, refund), "TETC refund failed");
             buyLevels[o.tick].totalLots -= o.lotsRemaining;
         } else {
@@ -273,8 +273,7 @@ contract SimpleLotTrade {
             Order storage m = orders[oid];
             uint256 f = m.lotsRemaining > remain ? remain : m.lotsRemaining;
 
-            uint256 price = PriceTicks.price(t);
-            uint256 pay = uint256(f) * price;
+            uint256 pay = uint256(f) * priceAtTick(t);
 
             // Taker pays maker in TETC
             require(TETC.transferFrom(msg.sender, m.owner, pay), "TETC pay failed");
@@ -327,8 +326,7 @@ contract SimpleLotTrade {
             Order storage m = orders[oid];
             uint256 f = m.lotsRemaining > remain ? remain : m.lotsRemaining;
 
-            uint256 price = PriceTicks.price(t);
-            uint256 pay = uint256(f) * price;
+            uint256 pay = uint256(f) * priceAtTick(t);
 
             // Taker delivers TKN10K to maker (buyer)
             require(TKN10K.transferFrom(msg.sender, m.owner, uint256(f)), "TKN10K pay failed");
@@ -498,7 +496,7 @@ contract SimpleLotTrade {
 
     function _newOrder(bool isBuy, int256 tick, uint256 lots) internal returns (uint256 id) {
         id = nextOrderId++;
-        orders[id] = Order(msg.sender, tick, PriceTicks.price(tick), lots, isBuy, 0, 0, true);
+        orders[id] = Order(msg.sender, tick, lots, isBuy, 0, 0, true);
     }
 
     function _enqueue(bool isBuy, int256 tick, uint256 id) internal {
@@ -627,10 +625,6 @@ contract SimpleLotTrade {
 
     /// @notice TETC base units (wei-style) per 1 lot at `tick` using 464-ticks/decade mantissa grid.
     /// @dev tick 0 => 1e18.
-
-    function tetcPerLotForTick(int256 tick) external pure returns (uint256) {
-        return PriceTicks.price(tick);
-    }
 
     function getBestTicks() external view returns (bool, int256, bool, int256) {
         return (hasBestBuy, bestBuyTick, hasBestSell, bestSellTick);

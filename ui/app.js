@@ -31,6 +31,7 @@ const clobAbi = [
   "function getSellBookDepth(uint256 maxLevels) external view returns (tuple(int256 tick,uint256 totalLots,uint256 orderCount)[] out, uint256 n)",
   "function getFullBuyBook(uint256 maxOrders) external view returns (tuple(uint256 id,address owner,int256 tick,uint256 lotsRemaining)[] out, uint256 n)",
   "function getFullSellBook(uint256 maxOrders) external view returns (tuple(uint256 id,address owner,int256 tick,uint256 lotsRemaining)[] out, uint256 n)",
+  "function priceAtTick(int256 tick) external pure returns (uint256)",
   "function hasBestBuy() external view returns (bool)",
   "function hasBestSell() external view returns (bool)",
   "function bestBuyTick() external view returns (int256)",
@@ -48,22 +49,39 @@ async function loadDepth() {
   if (!state.clob) return;
   const maxLevels = el("bookLevels").value.trim();
   if (!maxLevels) return;
+  let tetcDecimals = 18;
+  try {
+    if (state.tetc) {
+      tetcDecimals = await state.tetc.decimals();
+    }
+  } catch {
+    tetcDecimals = 18;
+  }
   const [buy, sell] = await Promise.all([
     state.clob.getBuyBookDepth(BigInt(maxLevels)),
     state.clob.getSellBookDepth(BigInt(maxLevels)),
   ]);
-  const buyRows = buy[0].slice(0, Number(buy[1])).map((lvl) => [
-    String(lvl.tick),
-    String(lvl.totalLots),
-    String(lvl.orderCount),
-  ]);
-  const sellRows = sell[0].slice(0, Number(sell[1])).map((lvl) => [
-    String(lvl.tick),
-    String(lvl.totalLots),
-    String(lvl.orderCount),
-  ]);
-  renderTable("buyDepth", ["Tick", "Lots", "Orders"], buyRows);
-  renderTable("sellDepth", ["Tick", "Lots", "Orders"], sellRows);
+    const buyLevels = buy[0].slice(0, Number(buy[1]));
+    const sellLevels = sell[0].slice(0, Number(sell[1]));
+    const priceCalls = [
+      ...buyLevels.map((lvl) => state.clob.priceAtTick(lvl.tick)),
+      ...sellLevels.map((lvl) => state.clob.priceAtTick(lvl.tick)),
+    ];
+    const prices = await Promise.all(priceCalls);
+    const buyPrices = prices.slice(0, buyLevels.length);
+    const sellPrices = prices.slice(buyLevels.length);
+    const buyRows = buyLevels.map((lvl, i) => [
+      String(lvl.tick),
+      String(lvl.totalLots),
+      ethers.formatUnits(buyPrices[i], tetcDecimals),
+    ]);
+    const sellRows = sellLevels.map((lvl, i) => [
+      String(lvl.tick),
+      String(lvl.totalLots),
+      ethers.formatUnits(sellPrices[i], tetcDecimals),
+    ]);
+    renderTable("buyDepth", ["Tick", "Lots", "Price"], buyRows);
+    renderTable("sellDepth", ["Tick", "Lots", "Price"], sellRows);
 }
 
 async function loadOrders() {
