@@ -29,8 +29,6 @@ const clobAbi = [
   "function TKN10K() external view returns (address)",
   "function getBuyBookDepth(uint256 maxLevels) external view returns (tuple(int256 tick,uint256 totalLots,uint256 orderCount)[] out, uint256 n)",
   "function getSellBookDepth(uint256 maxLevels) external view returns (tuple(int256 tick,uint256 totalLots,uint256 orderCount)[] out, uint256 n)",
-  "function getFullBuyBook(uint256 maxOrders) external view returns (tuple(uint256 id,address owner,int256 tick,uint256 lotsRemaining)[] out, uint256 n)",
-  "function getFullSellBook(uint256 maxOrders) external view returns (tuple(uint256 id,address owner,int256 tick,uint256 lotsRemaining)[] out, uint256 n)",
   "function priceAtTick(int256 tick) external pure returns (uint256)",
   "function hasBestBuy() external view returns (bool)",
   "function hasBestSell() external view returns (bool)",
@@ -84,33 +82,11 @@ async function loadDepth() {
     renderTable("sellDepth", ["Tick", "Lots", "Price"], sellRows);
 }
 
-async function loadOrders() {
-  if (!state.clob) return;
-  const maxOrders = el("bookOrders").value.trim();
-  if (!maxOrders) return;
-  const [buy, sell] = await Promise.all([
-    state.clob.getFullBuyBook(BigInt(maxOrders)),
-    state.clob.getFullSellBook(BigInt(maxOrders)),
-  ]);
-  const buyRows = buy[0].slice(0, Number(buy[1])).map((ord) => [
-    String(ord.id),
-    String(ord.tick),
-    String(ord.lotsRemaining),
-  ]);
-  const sellRows = sell[0].slice(0, Number(sell[1])).map((ord) => [
-    String(ord.id),
-    String(ord.tick),
-    String(ord.lotsRemaining),
-  ]);
-  renderTable("buyOrders", ["ID", "Tick", "Lots"], buyRows);
-  renderTable("sellOrders", ["ID", "Tick", "Lots"], sellRows);
-}
-
 async function refreshOrderbook() {
   if (!state.clob || state.refreshInFlight) return;
   state.refreshInFlight = true;
   try {
-    await Promise.all([refreshBestTicks(), loadDepth(), loadOrders()]);
+    await Promise.all([refreshBestTicks(), loadDepth()]);
   } catch (err) {
     addLog("Error", err.message);
   } finally {
@@ -451,12 +427,4 @@ el("loadDepthBtn").addEventListener("click", async () => {
   }
 });
 
-el("loadOrdersBtn").addEventListener("click", async () => {
-  try {
-    await loadOrders();
-    addLog("Orderbook", "Orders loaded.");
-  } catch (err) {
-    addLog("Error", err.message);
-  }
-});
 import { ethers } from "https://cdn.jsdelivr.net/npm/ethers@6.16.0/+esm";
