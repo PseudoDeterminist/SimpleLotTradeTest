@@ -5,16 +5,20 @@ pragma solidity ^0.8.28;
   SimpleLotTrade v0.5.0 (Design / Mordor Testnet)
   -----------------------------------------------
   Core goals:
+  - This is a Test Contract version, using test tokens we have created
+      * TETC (Test ETC) as quote token and TKN10K (Test Token 10K) as base Lot token
+      * TKN is base token but we wrap that in integer TKN10K lots (1 lot = 10,000 TKN)
   - Tick-only Central Limit Order Book for TKN10K lots (decimals=0), priced in TETC (18 decimals)
-  - FOK takers only
+  - Fill Or Kill takers only
   - No internal balances:
       * Makers escrow tokens in the contract on order placement
       * Escrow released on fill/partial fill/cancel
   - Price grid:
-      * 464 ticks per decade (~0.5% per tick)
-      * Mantissa table: 464 uint16 values (1000..9950), packed big-endian into bytes constant
+      * 464 ticks exponential growth curve from 1000 to 9950, repeating at "decades"  every 10x price 
+      * Approximately 0.5% increase per tick
+      * Mantissa table: 464 uint16 values (1000..9950) = 1 decade packed big-endian into bytes constant
       * Tick 0 price = 1e18 (1.000 TETC per lot)
-      * Tick range: [-2320, +2320] (5 decades down/up)
+      * Tick range: [-464, +1392] (5 decades down/up)
   New in v0.5.0:
   - bookVersion: increments once per successful book-mutating tx (place/cancel/take)
   - Events + integrity:
@@ -365,52 +369,56 @@ contract SimpleLotTrade {
 
     /* -------------------- Taker FOK -------------------- */
 
-    function takeBuyFOK(int256 limitTick, uint256 lots) external nonReentrant {
+    function takeBuyFOK(int256 limitTick, uint256 lots, uint256 maxQuoteIn) external nonReentrant {
         require(hasBestSell, "no sells");
         require(lots > 0, "zero lots");
-
+    
         uint256 remain = lots;
+        uint256 spent = 0;
+    
         int256 t = bestSellTick;
         int256 lastFilledTick;
-
+    
         while (remain > 0) {
             require(t <= limitTick, "FOK");
             TickLevel storage lvl = sellLevels[t];
             require(lvl.head != 0, "empty level");
-
-            // Compute once per tick level
-            uint256 price = priceAtTick(t);
-
-            // Drain this tick level before moving to next tick
+    
+            uint256 price = priceAtTick(t); // once per tick
+    
             while (remain > 0) {
                 uint256 oid = lvl.head;
                 if (oid == 0) break;
-
+    
                 Order storage m = orders[oid];
                 uint256 f = m.lotsRemaining > remain ? remain : m.lotsRemaining;
-
+    
                 uint256 pay = f * price;
-
+    
+                // Slippage guard: total quote spent cannot exceed maxQuoteIn
+                spent += pay;
+                require(spent <= maxQuoteIn, "slippage");
+    
                 // Taker delivers TETC to maker (seller)
                 require(TETC.transferFrom(msg.sender, m.owner, pay), "TETC pay failed");
-
+    
                 // Contract releases escrowed TKN10K to taker
                 require(TKN10K.transfer(msg.sender, f), "TKN10K deliver failed");
-
+    
                 m.lotsRemaining -= f;
                 lvl.totalLots -= f;
                 remain -= f;
-
+    
                 _emitTrade(oid, msg.sender, m.owner, true, t, f, price, pay, m.lotsRemaining);
-
+    
                 lastFilledTick = t;
-
+    
                 if (m.lotsRemaining == 0) {
                     _removeHead(false, t);
                     delete orders[oid];
                 }
             }
-
+    
             if (lvl.head == 0) {
                 int256 nxt = lvl.next;
                 _removeTick(false, t);
@@ -418,61 +426,62 @@ contract SimpleLotTrade {
                 t = nxt;
             }
         }
-
+    
         require(remain == 0, "unfilled");
-
+    
         lastTradeTick = lastFilledTick;
         lastTradeBlock = block.number;
-
+    
         bookVersion += 1;
     }
-
-    function takeSellFOK(int256 limitTick, uint256 lots) external nonReentrant {
+    
+    function takeSellFOK(int256 limitTick, uint256 lots, uint256 minQuoteOut) external nonReentrant {
         require(hasBestBuy, "no buys");
         require(lots > 0, "zero lots");
-
+    
         uint256 remain = lots;
+        uint256 got = 0;
+    
         int256 t = bestBuyTick;
         int256 lastFilledTick;
-
+    
         while (remain > 0) {
             require(t >= limitTick, "FOK");
             TickLevel storage lvl = buyLevels[t];
             require(lvl.head != 0, "empty level");
-
-            // Compute once per tick level
-            uint256 price = priceAtTick(t);
-
-            // Drain this tick level before moving to next tick
+    
+            uint256 price = priceAtTick(t); // once per tick
+    
             while (remain > 0) {
                 uint256 oid = lvl.head;
                 if (oid == 0) break;
-
+    
                 Order storage m = orders[oid];
                 uint256 f = m.lotsRemaining > remain ? remain : m.lotsRemaining;
-
+    
                 uint256 receiveAmt = f * price;
-
+                got += receiveAmt;
+    
                 // Taker delivers TKN10K to maker (buyer)
                 require(TKN10K.transferFrom(msg.sender, m.owner, f), "TKN10K pay failed");
-
+    
                 // Contract releases escrowed TETC to taker
                 require(TETC.transfer(msg.sender, receiveAmt), "TETC deliver failed");
-
+    
                 m.lotsRemaining -= f;
                 lvl.totalLots -= f;
                 remain -= f;
-
+    
                 _emitTrade(oid, msg.sender, m.owner, false, t, f, price, receiveAmt, m.lotsRemaining);
-
+    
                 lastFilledTick = t;
-
+    
                 if (m.lotsRemaining == 0) {
                     _removeHead(true, t);
                     delete orders[oid];
                 }
             }
-
+    
             if (lvl.head == 0) {
                 int256 nxt = lvl.next;
                 _removeTick(true, t);
@@ -480,12 +489,13 @@ contract SimpleLotTrade {
                 t = nxt;
             }
         }
-
+    
         require(remain == 0, "unfilled");
-
+        require(got >= minQuoteOut, "slippage");
+    
         lastTradeTick = lastFilledTick;
         lastTradeBlock = block.number;
-
+    
         bookVersion += 1;
     }
 
