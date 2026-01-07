@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 /*
-  SimpleLotTrade v0.6.2 (Design / Testnet)
+  SimpleLotrade v0.6.2 (Design / Testnet)
   By PseudoDeterminist
   ----------------------------------------------------------------------------
   - This contract does price discovery using order book for lot trades on Ethereum Classic
@@ -16,7 +16,7 @@ pragma solidity ^0.8.28;
       * Base token TKN is never used directly in the contract
   - We use a price grid to limit order book "dust moves" (moving in front of an order is a 0.5% move)
       * Prices are represented as "ticks" on an exponential price curve:
-      * 464 ticks exponential growth curve from 1000 to 9950, repeating at "decades"  every 10x price 
+      * 464 ticks exponential growth curve from 1000 to 9950, repeating at "decades"  every 10x price
       * Approximately 0.5% increase per tick
       * Mantissa table: 464 uint16 values (decimal 1000..9950) = 1 decade packed into bytes constant
       * The mantissa represents (limit-excluded) prices from 1000 wei to 9950 wei per lot
@@ -43,6 +43,10 @@ pragma solidity ^0.8.28;
   - MaxQuoteIn / MinQuoteOut protection for takers
       * Order books can move before taker tx mined
       * Taker specifies max quote to spend (buy) or min quote to receive (sell)
+  - Events + integrity hash chain:
+      * historySeq increments per emitted event
+      * historyHash chains over record hashes of each emitted event
+      * each event includes (seq, newHash) for easy verification
 */
 
 interface IERC20 {
@@ -52,7 +56,7 @@ interface IERC20 {
 
 /* ===================== Lot CLOB ===================== */
 
-contract SimpleLotTrade {
+contract SimpleLotrade {
     // Tick range: -464 .. +1391
     int256 private constant MIN_TICK = -464; // 0.1 TETC per lot; 0.00001 TETC per TKN
     int256 private constant MAX_TICK =  1391; // 995 TETC per lot;  ~0.1 TETC per TKN
@@ -62,12 +66,15 @@ contract SimpleLotTrade {
     IERC20 public immutable TETC;    // quote token (18 decimals)
     IERC20 public immutable TKN10K;  // base token (0 decimals, integer lots)
 
+    // Event integrity chain (increments once per emitted event)
+    uint256 public historySeq;
+    bytes32 public historyHash;
+
     // Oracle
-    int256 public lastTradeTick;
-    uint256 public lastTradeBlock;
+    int256 public lastradeTick;
+    uint256 public lastradeBlock;
     int256 public bestBuyTick;
     int256 public bestSellTick;
-
 
     // Reentrancy guard (token transfers)
     uint256 private _lock = 1;
@@ -80,7 +87,14 @@ contract SimpleLotTrade {
 
     /* -------------------- Events -------------------- */
 
+    // Event type tags used in hash records
+    uint8 private constant EVT_PLACE  = 1;
+    uint8 private constant EVT_CANCEL = 2;
+    uint8 private constant EVT_TRADE  = 3;
+
     event OrderPlaced(
+        uint256 indexed seq,
+        bytes32 indexed newHash,
         uint256 indexed orderId,
         address owner,
         bool isBuy,
@@ -90,6 +104,8 @@ contract SimpleLotTrade {
     );
 
     event OrderCanceled(
+        uint256 indexed seq,
+        bytes32 indexed newHash,
         uint256 indexed orderId,
         address owner,
         bool isBuy,
@@ -100,6 +116,8 @@ contract SimpleLotTrade {
 
     // One Trade event per maker fill (FOK taker may generate multiple)
     event Trade(
+        uint256 indexed seq,
+        bytes32 indexed newHash,
         uint256 indexed makerOrderId,
         address taker,
         address maker,
@@ -192,28 +210,36 @@ contract SimpleLotTrade {
         TKN10K = IERC20(tkn10kToken);
         bestBuyTick = NONE;
         bestSellTick = NONE;
+        // historySeq defaults to 0, historyHash defaults to 0x00..00
     }
 
     /* -------------------- Price -------------------- */
 
-    function priceAtTick(int256 tick) public pure returns (uint256 result) {
+    function priceAtick(int256 tick) public pure returns (uint256 result) {
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
-    
+
         uint256 t = uint256(tick - MIN_TICK); // safe because of require above
         uint256 d = t / 464;                  // decade index (0..4)
         uint256 r = t % 464;                  // mantissa index
-    
+
         uint256 i = r * 2;
         uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
-    
+
         uint256 factor;
-        if (d == 0) factor = 1e14;       //  0.1 to  0.995 TETC per TKN10K = 0.00001 to  0.0000995 TETC per TKN
-        else if (d == 1) factor = 1e15;  //    1 to   9.95 TETC per TKN10K = 0.0001  to  0.000995  TETC per TKN
-        else if (d == 2) factor = 1e16;  //   10 to    995 TETC per TKN10K = 0.001   to  0.00995   TETC per TKN
-        else if (d == 3) factor = 1e17;  //  100 to    995 TETC per TKN10K = 0.01    to  0.0995    TETC per TKN
-        else factor = 1e18;              // 1000 to   9950 TETC per TKN10K = 0.1     to  0.995     TETC per TKN
-    
+        if (d == 0) factor = 1e14;       //  0.1 to     0.995 TETC per TKN10K = 0.00001 to  0.0000995 TETC per TKN
+        else if (d == 1) factor = 1e15;  //    1 to     9.95  TETC per TKN10K = 0.0001  to  0.000995  TETC per TKN
+        else if (d == 2) factor = 1e16;  //   10 to    99.5   TETC per TKN10K = 0.001   to  0.00995   TETC per TKN
+        else if (d == 3) factor = 1e17;  //  100 to   995     TETC per TKN10K = 0.01    to  0.0995    TETC per TKN
+        else factor = 1e18;              // 1000 to  9950     TETC per TKN10K = 0.1     to  0.995     TETC per TKN
+
         result = factor * m;
+    }
+
+    /* -------------------- Hash chain helpers (from old contract) -------------------- */
+
+    function _chainHash(bytes32 recordHash) internal returns (bytes32 newHash) {
+        newHash = keccak256(abi.encodePacked(historyHash, recordHash));
+        historyHash = newHash;
     }
 
     function _emitPlaced(
@@ -224,7 +250,8 @@ contract SimpleLotTrade {
         uint256 lots,
         uint256 escrowAmount
     ) internal {
-        emit OrderPlaced(orderId, owner, isBuy, tick, lots, escrowAmount);
+        bytes32 rec = keccak256(abi.encode(EVT_PLACE, ++historySeq, orderId, owner, isBuy, tick, lots, escrowAmount));
+        emit OrderPlaced(historySeq, _chainHash(rec), orderId, owner, isBuy, tick, lots, escrowAmount);
     }
 
     function _emitCanceled(
@@ -235,7 +262,8 @@ contract SimpleLotTrade {
         uint256 lotsCanceled,
         uint256 refundAmount
     ) internal {
-        emit OrderCanceled(orderId, owner, isBuy, tick, lotsCanceled, refundAmount);
+        bytes32 rec = keccak256(abi.encode(EVT_CANCEL, ++historySeq, orderId, owner, isBuy, tick, lotsCanceled, refundAmount));
+        emit OrderCanceled(historySeq, _chainHash(rec), orderId, owner, isBuy, tick, lotsCanceled, refundAmount);
     }
 
     function _emitTrade(
@@ -249,7 +277,24 @@ contract SimpleLotTrade {
         uint256 quoteAmount,
         uint256 makerLotsRemainingAfter
     ) internal {
+        bytes32 rec = keccak256(
+            abi.encode(
+                EVT_TRADE,
+                ++historySeq,
+                makerOrderId,
+                taker,
+                maker,
+                takerIsBuy,
+                tick,
+                lotsFilled,
+                pricePerLot,
+                quoteAmount,
+                makerLotsRemainingAfter
+            )
+        );
         emit Trade(
+            historySeq,
+            _chainHash(rec),
             makerOrderId,
             taker,
             maker,
@@ -266,10 +311,10 @@ contract SimpleLotTrade {
 
     function placeBuy(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
-        require(bestSellTick==NONE || bestSellTick > tick, "crossing sell book");
+        require(bestSellTick == NONE || bestSellTick > tick, "crossing sell book");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
-        uint256 cost = lots * priceAtTick(tick);
+        uint256 cost = lots * priceAtick(tick);
 
         // Escrow TETC in this contract
         require(TETC.transferFrom(msg.sender, address(this), cost), "TETC transferFrom failed");
@@ -282,7 +327,7 @@ contract SimpleLotTrade {
 
     function placeSell(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
-        require(bestBuyTick==NONE || bestBuyTick < tick, "crossing buy book");
+        require(bestBuyTick == NONE || bestBuyTick < tick, "crossing buy book");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         // Escrow TKN10K lots in this contract
@@ -303,7 +348,7 @@ contract SimpleLotTrade {
 
         // Refund remaining escrow
         if (o.isBuy) {
-            refundAmount = uint256(o.lotsRemaining) * priceAtTick(o.tick);
+            refundAmount = uint256(o.lotsRemaining) * priceAtick(o.tick);
             require(TETC.transfer(msg.sender, refundAmount), "TETC refund failed");
             buyLevels[o.tick].totalLots -= o.lotsRemaining;
         } else {
@@ -323,53 +368,53 @@ contract SimpleLotTrade {
     function takeBuyFOK(int256 limitTick, uint256 lots, uint256 maxQuoteIn) external nonReentrant {
         require(bestSellTick != NONE, "There are no sell orders on book");
         require(lots > 0, "zero lots");
-    
+
         uint256 remain = lots;
         uint256 spent = 0;
-    
+
         int256 t = bestSellTick;
         int256 lastFilledTick;
-    
+
         while (remain > 0) {
             require(t <= limitTick, "FOK");
             TickLevel storage lvl = sellLevels[t];
             require(lvl.head != 0, "empty level");
-    
-            uint256 price = priceAtTick(t); // once per tick
-    
+
+            uint256 price = priceAtick(t);
+
             while (remain > 0) {
                 uint256 oid = lvl.head;
                 if (oid == 0) break;
-    
+
                 Order storage m = orders[oid];
                 uint256 f = m.lotsRemaining > remain ? remain : m.lotsRemaining;
-    
+
                 uint256 pay = f * price;
-    
+
                 // Slippage guard: total quote spent cannot exceed maxQuoteIn
                 spent += pay;
                 require(spent <= maxQuoteIn, "slippage");
-    
+
                 // Taker delivers TETC to maker (seller)
                 require(TETC.transferFrom(msg.sender, m.owner, pay), "TETC pay failed");
-    
+
                 // Contract releases escrowed TKN10K to taker
                 require(TKN10K.transfer(msg.sender, f), "TKN10K deliver failed");
-    
+
                 m.lotsRemaining -= f;
                 lvl.totalLots -= f;
                 remain -= f;
-    
+
                 _emitTrade(oid, msg.sender, m.owner, true, t, f, price, pay, m.lotsRemaining);
-    
+
                 lastFilledTick = t;
-    
+
                 if (m.lotsRemaining == 0) {
                     _removeHead(false, t);
                     delete orders[oid];
                 }
             }
-    
+
             if (lvl.head == 0) {
                 int256 nxt = lvl.next;
                 _removeTick(false, t);
@@ -377,60 +422,60 @@ contract SimpleLotTrade {
                 t = nxt;
             }
         }
-    
+
         require(remain == 0, "unfilled");
-    
-        lastTradeTick = lastFilledTick;
-        lastTradeBlock = block.number;
+
+        lastradeTick = lastFilledTick;
+        lastradeBlock = block.number;
     }
-    
+
     function takeSellFOK(int256 limitTick, uint256 lots, uint256 minQuoteOut) external nonReentrant {
         require(bestBuyTick != NONE, "there are no buy orders on book");
         require(lots > 0, "zero lots");
-    
+
         uint256 remain = lots;
         uint256 got = 0;
-    
+
         int256 t = bestBuyTick;
         int256 lastFilledTick;
-    
+
         while (remain > 0) {
             require(t >= limitTick, "FOK");
             TickLevel storage lvl = buyLevels[t];
             require(lvl.head != 0, "empty level");
-    
-            uint256 price = priceAtTick(t); // once per tick
-    
+
+            uint256 price = priceAtick(t);
+
             while (remain > 0) {
                 uint256 oid = lvl.head;
                 if (oid == 0) break;
-    
+
                 Order storage m = orders[oid];
                 uint256 f = m.lotsRemaining > remain ? remain : m.lotsRemaining;
-    
+
                 uint256 receiveAmt = f * price;
                 got += receiveAmt;
-    
+
                 // Taker delivers TKN10K to maker (buyer)
                 require(TKN10K.transferFrom(msg.sender, m.owner, f), "TKN10K pay failed");
-    
+
                 // Contract releases escrowed TETC to taker
                 require(TETC.transfer(msg.sender, receiveAmt), "TETC deliver failed");
-    
+
                 m.lotsRemaining -= f;
                 lvl.totalLots -= f;
                 remain -= f;
-    
+
                 _emitTrade(oid, msg.sender, m.owner, false, t, f, price, receiveAmt, m.lotsRemaining);
-    
+
                 lastFilledTick = t;
-    
+
                 if (m.lotsRemaining == 0) {
                     _removeHead(true, t);
                     delete orders[oid];
                 }
             }
-    
+
             if (lvl.head == 0) {
                 int256 nxt = lvl.next;
                 _removeTick(true, t);
@@ -438,146 +483,12 @@ contract SimpleLotTrade {
                 t = nxt;
             }
         }
-    
+
         require(remain == 0, "unfilled");
         require(got >= minQuoteOut, "slippage");
-    
-        lastTradeTick = lastFilledTick;
-        lastTradeBlock = block.number;
-    }
 
-    /* -------------------- Full Book + Depth Views (single-pass, bounded) -------------------- */
-
-    function getFullBuyBook(uint256 maxOrders)
-        external
-        view
-        returns (BookOrder[] memory out, uint256 n)
-    {
-        return _getFullBookSinglePass(true, maxOrders);
-    }
-
-    function getFullSellBook(uint256 maxOrders)
-        external
-        view
-        returns (BookOrder[] memory out, uint256 n)
-    {
-        return _getFullBookSinglePass(false, maxOrders);
-    }
-
-    function _getFullBookSinglePass(bool isBuy, uint256 maxOrders)
-        internal
-        view
-        returns (BookOrder[] memory out, uint256 n)
-    {
-        if (maxOrders == 0) return (new BookOrder[](0), 0);
-
-        if (isBuy) {
-            if (bestBuyTick == NONE) return (new BookOrder[](0), 0);
-        } else {
-            if (bestSellTick == NONE) return (new BookOrder[](0), 0);
-        }
-
-        out = new BookOrder[](maxOrders);
-        n = 0;
-
-        if (isBuy) {
-            int256 tt = bestBuyTick;
-            while (tt != NONE && n < maxOrders) {
-                TickLevel storage lvl = buyLevels[tt];
-                uint256 oid = lvl.head;
-                while (oid != 0 && n < maxOrders) {
-                    Order storage o = orders[oid];
-                    out[n++] = BookOrder(oid, o.owner, o.tick, o.lotsRemaining);
-                    oid = o.next;
-                }
-                tt = lvl.next;
-            }
-        } else {
-            int256 tt = bestSellTick;
-            while (tt != NONE && n < maxOrders) {
-                TickLevel storage lvl = sellLevels[tt];
-                uint256 oid = lvl.head;
-                while (oid != 0 && n < maxOrders) {
-                    Order storage o = orders[oid];
-                    out[n++] = BookOrder(oid, o.owner, o.tick, o.lotsRemaining);
-                    oid = o.next;
-                }
-                tt = lvl.next;
-            }
-        }
-    }
-
-    function getBuyBookDepth(uint256 maxLevels)
-        external
-        view
-        returns (BookLevel[] memory out, uint256 n)
-    {
-        return _getDepthSinglePass(true, maxLevels);
-    }
-
-    function getSellBookDepth(uint256 maxLevels)
-        external
-        view
-        returns (BookLevel[] memory out, uint256 n)
-    {
-        return _getDepthSinglePass(false, maxLevels);
-    }
-
-    function _getDepthSinglePass(bool isBuy, uint256 maxLevels)
-        internal
-        view
-        returns (BookLevel[] memory out, uint256 n)
-    {
-        if (maxLevels == 0) return (new BookLevel[](0), 0);
-
-        if (isBuy) {
-            if (bestBuyTick == NONE) return (new BookLevel[](0), 0);
-        } else {
-            if (bestSellTick == NONE) return (new BookLevel[](0), 0);
-        }
-
-        out = new BookLevel[](maxLevels);
-        n = 0;
-
-        if (isBuy) {
-            int256 tt = bestBuyTick;
-            while (tt != NONE && n < maxLevels) {
-                TickLevel storage lvl = buyLevels[tt];
-                if (lvl.totalLots > 0) out[n++] = BookLevel(tt, lvl.totalLots, lvl.orderCount);
-                tt = lvl.next;
-            }
-        } else {
-            int256 tt = bestSellTick;
-            while (tt != NONE && n < maxLevels) {
-                TickLevel storage lvl = sellLevels[tt];
-                if (lvl.totalLots > 0) out[n++] = BookLevel(tt, lvl.totalLots, lvl.orderCount);
-                tt = lvl.next;
-            }
-        }
-    }
-
-    function getTopOfBook() external view returns (
-        int256, uint256, uint256,
-        int256, uint256, uint256
-    ) {
-        uint256 buyLots;
-        uint256 buyOrders;
-        uint256 sellLots;
-        uint256 sellOrders;
-
-        if (bestBuyTick != NONE) {
-            TickLevel storage b = buyLevels[bestBuyTick];
-            buyLots = b.totalLots;
-            buyOrders = b.orderCount;
-        }
-
-        if (bestSellTick != NONE) {
-            TickLevel storage s = sellLevels[bestSellTick];
-            sellLots = s.totalLots;
-            sellOrders = s.orderCount;
-        }
-
-        return (bestBuyTick, buyLots, buyOrders, bestSellTick, sellLots, sellOrders);
+        lastradeTick = lastFilledTick;
+        lastradeBlock = block.number;
     }
 
     /* -------------------- Internals: Orders / Levels -------------------- */
@@ -591,7 +502,7 @@ contract SimpleLotTrade {
         TickLevel storage lvl = isBuy ? buyLevels[tick] : sellLevels[tick];
 
         if (!lvl.exists) {
-            _insertTick(isBuy, tick);
+            _insertick(isBuy, tick);
         }
 
         if (lvl.tail == 0) {
@@ -607,7 +518,7 @@ contract SimpleLotTrade {
         lvl.totalLots += orders[id].lotsRemaining;
     }
 
-    function _insertTick(bool isBuy, int256 tick) internal {
+    function _insertick(bool isBuy, int256 tick) internal {
         TickLevel storage lvl = isBuy ? buyLevels[tick] : sellLevels[tick];
         lvl.exists = true;
         lvl.prev = NONE;
@@ -706,20 +617,93 @@ contract SimpleLotTrade {
 
     /* -------------------- Misc views -------------------- */
 
-    function getOracle() external view returns (int256, int256, int256, uint256) {
-        return (bestBuyTick, bestSellTick, lastTradeTick, lastTradeBlock);
+    function getBuyBook(uint256 maxLevels)
+        external
+        view
+        returns (BookLevel[] memory out, uint256 n)
+    {
+        return getBook(true, maxLevels);
     }
 
-    // function getLevel(bool isBuy, int256 tick) external view returns (
-    //     bool exists,
-    //     int256 prev,
-    //     int256 next,
-    //     uint256 head,
-    //     uint256 tail,
-    //     uint256 orderCount,
-    //     uint256 totalLots
-    // ) {
-    //     TickLevel storage l = isBuy ? buyLevels[tick] : sellLevels[tick];
-    //     return (l.exists, l.prev, l.next, l.head, l.tail, l.orderCount, l.totalLots);
-    // }
+    function getSellBook(uint256 maxLevels)
+        external
+        view
+        returns (BookLevel[] memory out, uint256 n)
+    {
+        return getBook(false, maxLevels);
+    }
+
+    function getBook(bool isBuy, uint256 maxLevels)
+        internal
+        view
+        returns (BookLevel[] memory out, uint256 n)
+    {
+        if (maxLevels == 0) return (new BookLevel[](0), 0);
+
+        if (isBuy) {
+            if (bestBuyTick == NONE) return (new BookLevel[](0), 0);
+        } else {
+            if (bestSellTick == NONE) return (new BookLevel[](0), 0);
+        }
+
+        out = new BookLevel[](maxLevels);
+        n = 0;
+
+        if (isBuy) {
+            int256 t = bestBuyTick;
+            while (t != NONE && n < maxLevels) {
+                TickLevel storage lvl = buyLevels[t];
+                if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.totalLots, lvl.orderCount);
+                t = lvl.next;
+            }
+        } else {
+            int256 t = bestSellTick;
+            while (t != NONE && n < maxLevels) {
+                TickLevel storage lvl = sellLevels[t];
+                if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.totalLots, lvl.orderCount);
+                t = lvl.next;
+            }
+        }
+    }
+
+    function getTopOfBook() external view returns (
+        int256, uint256, uint256,
+        int256, uint256, uint256
+    ) {
+        uint256 buyLots;
+        uint256 buyOrders;
+        uint256 sellLots;
+        uint256 sellOrders;
+
+        if (bestBuyTick != NONE) {
+            TickLevel storage b = buyLevels[bestBuyTick];
+            buyLots = b.totalLots;
+            buyOrders = b.orderCount;
+        }
+
+        if (bestSellTick != NONE) {
+            TickLevel storage s = sellLevels[bestSellTick];
+            sellLots = s.totalLots;
+            sellOrders = s.orderCount;
+        }
+
+        return (bestBuyTick, buyLots, buyOrders, bestSellTick, sellLots, sellOrders);
+    }
+
+    function getOracle() external view returns (int256, int256, int256, uint256) {
+        return (bestBuyTick, bestSellTick, lastradeTick, lastradeBlock);
+    }
+
+    function getLevel(bool isBuy, int256 tick) external view returns (
+        bool exists,
+        int256 prev,
+        int256 next,
+        uint256 head,
+        uint256 tail,
+        uint256 orderCount,
+        uint256 totalLots
+    ) {
+        TickLevel storage l = isBuy ? buyLevels[tick] : sellLevels[tick];
+        return (l.exists, l.prev, l.next, l.head, l.tail, l.orderCount, l.totalLots);
+    }
 }
