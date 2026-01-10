@@ -5,48 +5,8 @@ pragma solidity ^0.8.28;
   SimpleLotrade v0.6.3 (Design / Testnet)
   By PseudoDeterminist
   ----------------------------------------------------------------------------
-  - This contract does price discovery using order book for lot trades on Ethereum Classic
-      * This is intended as a high-value, high-assurance trading venue for large trades
-      * Low tx volume, high value trades
-      * Simple, gas efficient, secure design
-      * Order book is doubly-linked list and always sorted
-  - This is a Test Contract version, using test tokens we have created
-      * TETC (Test ETC) as quote token and TKN10K (Test Token 10K) as base Lot token
-      * TKN is base token but we wrap that in integer TKN10K lots (1 lot = 10,000 TKN)
-      * Base token TKN is never used directly in the contract
-  - We use a price grid to limit order book "dust moves" (moving in front of an order is a 0.5% move)
-      * Prices are represented as "ticks" on an exponential price curve:
-      * 464 ticks exponential growth curve from 1000 to 9950, repeating at "decades"  every 10x price
-      * Approximately 0.5% increase per tick
-      * Mantissa table: 464 uint16 values (decimal 1000..9950) = 1 decade packed into bytes constant
-      * The mantissa represents (limit-excluded) prices from 1000 wei to 9950 wei per lot
-      * Tick 0 price = 1e18 (1.000 TETC per lot)
-      * Tick range: [-464, +1391] (.1 TETC to just under 1000 TETC price per TKN10K)
-  - Min Lot Price: 0.1 TETC per lot; 0.00001 TETC per TKN
-  - Max Lot Price: 9950 TETC per lot; .995 TETC per TKN
-      * This is not intended for market control, just to limit spam orders at low prices
-      * This is a lot market and relies on a minimum lot price to help limit potential spam
-      * If TKN10K price goes lower than the contract Min, other trading venues should be used
-      * TKN economics should dictate MIN and MAX prices in any real deployment, set accordingly
-      * higher MAX is less of a spam concern since makers must escrow TETC
-      * MAX limit in place mainly for math safety
-  - Taker orders:
-      * Fill or Kill only (FOK)
-      * No resting taker orders
-      * No partial fills for takers
-  - Maker orders:
-      * Resting orders only
-      * Partial fills allowed
-  - No internal balances:
-      * Makers escrow tokens in the contract on order placement
-      * Escrow released on fill/partial fill/cancel
-  - MaxQuoteIn / MinQuoteOut protection for takers
-      * Order books can move before taker tx mined
-      * Taker specifies max quote to spend (buy) or min quote to receive (sell)
-  - Events + integrity hash chain:
-      * historySeq increments per emitted event
-      * historyHash chains over record hashes of each emitted event
-      * each event includes (seq, newHash) for easy verification
+  See README at https://github.com/PseudoDeterminist/SimpleLotTrade for details.
+  ----------------------------------------------------------------------------
 */
 
 interface IERC20 {
