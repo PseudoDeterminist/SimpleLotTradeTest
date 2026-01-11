@@ -325,7 +325,7 @@ contract SimpleLotrade {
             totalSellEscrowTKN10K -= refundAmount;
         }
 
-        _unlinkOrder(o.isBuy, o.tick, id);
+        _unlinkOrder(o.isBuy, o.tick, id, lotsCanceled, refundAmount);
         _emitCanceled(id, msg.sender, o.isBuy, o.tick, lotsCanceled, refundAmount);
 
         delete orders[id];
@@ -559,7 +559,13 @@ contract SimpleLotrade {
         lvl.orderCount--;
     }
 
-    function _unlinkOrder(bool isBuy, int256 tick, uint256 id) internal {
+    function _unlinkOrder(
+        bool isBuy,
+        int256 tick,
+        uint256 id,
+        uint256 lotsRemoved,
+        uint256 quoteRemoved
+    ) internal {
         TickLevel storage lvl = isBuy ? buyLevels[tick] : sellLevels[tick];
         Order storage o = orders[id];
 
@@ -568,6 +574,14 @@ contract SimpleLotrade {
 
         if (o.next == 0) lvl.tail = o.prev;
         else orders[o.next].prev = o.prev;
+
+        lvl.totalLots -= lotsRemoved;
+        if (isBuy) {
+            lvl.totalQuote -= quoteRemoved;
+            totalBuyEscrowTETC -= quoteRemoved;
+        } else {
+            totalSellEscrowTKN10K -= lotsRemoved;
+        }
 
         lvl.orderCount--;
         if (lvl.head == 0) _removeTick(isBuy, tick);
