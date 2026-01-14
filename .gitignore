@@ -23,4 +23,4 @@ out/
 .DS_Store
 
 # core-geth files
-chaindata/
+chaindata/hardhat-node.log
