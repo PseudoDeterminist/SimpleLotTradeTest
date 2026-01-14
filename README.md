@@ -1,7 +1,5 @@
 # Simple Lot Trading EVM Contract
 
-Maker orders that would cross the book are rejected; crossing the spread requires explicit taker FOK calls.
-
 This project demonstrates a basic Lot Trading token pair, intended for the Ethereum Classic blockchain. It's especially suited for ETC because it's meant to trade at the speed of proof of work: Slowly but at high value.
 
 The tokens in this contract are generic test tokens, worth zero and always will be (They'll be given away freely to users who want to test on chain).
