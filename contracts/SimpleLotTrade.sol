@@ -98,6 +98,7 @@ contract SimpleLotrade {
     /* -------------------- Order book data -------------------- */
 
     struct Order {
+        bool exists;
         address owner;
         int256 tick;
         uint256 lotsRemaining;           // if isBuy: TKN10K Ask remaining; else TKN10K Escrow remaining
@@ -105,11 +106,11 @@ contract SimpleLotrade {
         bool isBuy;
         uint256 prev;
         uint256 next;
-        bool exists;
     }
 
     struct TickLevel {
         bool exists;
+        uint256 price;
         int256 prev;
         int256 next;
         uint256 head;
@@ -128,6 +129,7 @@ contract SimpleLotrade {
     // Book return structs
     struct BookLevel {
         int256 tick;
+        uint256 price;
         uint256 totalLots;               // if buyLevel: TKN10K Ask total; else TKN10K Escrow total
         uint256 totalValue;              // if buyLevel: TETC Escrow total; else TETC Ask total
         uint256 orderCount;
@@ -281,13 +283,14 @@ contract SimpleLotrade {
         require(bestSellTick == NONE || bestSellTick > tick, "crossing sell book -- consider takeBuyFOK");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
-        uint256 cost = lots * priceAtTick(tick);
+        uint256 price = priceAtTick(tick);
+        uint256 cost = lots * price;
 
         // Escrow TETC in this contract
         TETC.safeTransferFrom(msg.sender, address(this), cost); // reverts on insufficient balance/allowance
 
         id = _newOrder(true, tick, lots, cost);
-        _enqueue(true, tick, lots, cost, id);
+        _enqueue(true, tick, lots, price, cost, id);
 
         // Track buy escrow (per-level and global)
         buyLevels[tick].totalValue += cost;
@@ -305,9 +308,11 @@ contract SimpleLotrade {
         // Escrow TKN10K lots in this contract
         TKN10K.safeTransferFrom(msg.sender, address(this), uint256(lots));  // reverts on insufficient balance/allowance
 
-        uint256 value = lots * priceAtTick(tick);
+        uint256 price = priceAtTick(tick);
+        uint256 value = lots * price;
+
         id = _newOrder(false, tick, lots, value);
-        _enqueue(false, tick, lots, value, id);
+        _enqueue(false, tick, price, lots, value, id);
 
         // Track sell escrow (global). Per-level is already totalLots.
         bookEscrowTKN10K += lots;
@@ -501,14 +506,14 @@ contract SimpleLotrade {
 
     function _newOrder(bool isBuy, int256 tick, uint256 lots, uint256 value) internal returns (uint256 id) {
         id = nextOrderId++;
-        orders[id] = Order(msg.sender, tick, lots, value, isBuy, 0, 0, true);
+        orders[id] = Order(true, msg.sender, tick, lots, value, isBuy, 0, 0);
     }
 
-    function _enqueue(bool isBuy, int256 tick, uint256 lots, uint256 value, uint256 id) internal {
+    function _enqueue(bool isBuy, int256 tick, uint256 price,uint256 lots, uint256 value, uint256 id) internal {
         TickLevel storage lvl = isBuy ? buyLevels[tick] : sellLevels[tick];
 
         if (!lvl.exists) {
-            _insertTick(isBuy, tick);
+            _insertTick(isBuy, tick, price);
         }
 
         if (lvl.tail == 0) {
@@ -525,9 +530,10 @@ contract SimpleLotrade {
         lvl.totalLots += lots;
     }
 
-    function _insertTick(bool isBuy, int256 tick) internal {
+    function _insertTick(bool isBuy, int256 tick, uint256 price) internal {
         TickLevel storage lvl = isBuy ? buyLevels[tick] : sellLevels[tick];
         lvl.exists = true;
+        lvl.price = price;
         lvl.prev = NONE;
         lvl.next = NONE;
 
@@ -656,14 +662,14 @@ contract SimpleLotrade {
             int256 t = bestBuyTick;
             while (t != NONE && n < maxLevels) {
                 TickLevel storage lvl = buyLevels[t];
-                if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.totalLots, lvl.totalValue, lvl.orderCount);
+                if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.price,lvl.totalLots, lvl.totalValue, lvl.orderCount);
                 t = lvl.next;
             }
         } else {
             int256 t = bestSellTick;
             while (t != NONE && n < maxLevels) {
                 TickLevel storage lvl = sellLevels[t];
-                if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.totalLots, lvl.totalValue, lvl.orderCount);
+                if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.price, lvl.totalLots, lvl.totalValue, lvl.orderCount);
                 t = lvl.next;
             }
         }
