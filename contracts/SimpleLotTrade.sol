@@ -29,8 +29,8 @@ contract SimpleLotrade {
     bytes32 public historyHash;
 
     // Oracle
-    int256 public lastradeTick;
-    uint256 public lastradeBlock;
+    int256 public lastTradeTick;
+    uint256 public lastTradeBlock;
     int256 public bestBuyTick;
     int256 public bestSellTick;
 
@@ -277,7 +277,7 @@ contract SimpleLotrade {
 
     function placeBuy(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0 && lots < MAX_LOTS, "invalid lots");
-        require(bestSellTick == NONE || bestSellTick > tick, "crossing sell book");
+        require(bestSellTick == NONE || bestSellTick > tick, "crossing sell book -- consider takeBuyFOK");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         uint256 cost = lots * priceAtTick(tick);
@@ -298,7 +298,7 @@ contract SimpleLotrade {
 
     function placeSell(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0 && lots < MAX_LOTS, "invalid lots");
-        require(bestBuyTick == NONE || bestBuyTick < tick, "crossing buy book");
+        require(bestBuyTick == NONE || bestBuyTick < tick, "crossing buy book -- consider takeSellFOK");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         // Escrow TKN10K lots in this contract
@@ -324,19 +324,19 @@ contract SimpleLotrade {
 
         // Refund remaining escrow
         if (o.isBuy) {
-            TETC.safeTransfer(msg.sender, valueRemaining);
-
             buyLevels[o.tick].totalLots -= lotsRemaining;
             buyLevels[o.tick].totalValue -= valueRemaining;
             bookEscrowTETC -= valueRemaining;
             bookAskTKN10K -= lotsRemaining;
-        } else {
-            TKN10K.safeTransfer(msg.sender, lotsRemaining);
 
+            TETC.safeTransfer(msg.sender, valueRemaining);   // only after state updates
+        } else {
             sellLevels[o.tick].totalLots -= lotsRemaining;
             sellLevels[o.tick].totalValue -= valueRemaining;
             bookAskTETC -= valueRemaining;
             bookEscrowTKN10K -= lotsRemaining;
+
+            TKN10K.safeTransfer(msg.sender, lotsRemaining);   // only after state updates
         }
 
         _unlinkOrder(o.isBuy, o.tick, id);
@@ -348,23 +348,21 @@ contract SimpleLotrade {
     /* -------------------- Taker FOK -------------------- */
 
     function takeBuyFOK(int256 limitTick, uint256 lots, uint256 maxTetcIn) external nonReentrant {
+        require(lots > 0, "You requested zero lots");
         require(bestSellTick != NONE, "There are no sell orders on book");
-        require(maxTetcIn < bookEscrowTKN10K , "insufficient sell orders on book");
-        require(bestSellTick <= limitTick, "limit buy too low");
-        require(lots > 0, "zero lots");
+        require(lots <= bookEscrowTKN10K, "insufficient sell orders on book");
 
-        TETC.safeTransferFrom(msg.sender, address(this), maxTetcIn); // escrow maxTetcIn
+        TETC.safeTransferFrom(msg.sender, address(this), maxTetcIn); // escrow maxTetcIn. reverts on insufficient balance/allowance
 
         uint256 remain = lots;
         uint256 spent = 0;
 
         int256 t = bestSellTick;
-        int256 lastFilledTick;
+        int256 lastFilledTick;    // internal tracking, see lastTradeTick for global
 
         while (remain > 0) {
             require(t <= limitTick, "FOK");
             TickLevel storage lvl = sellLevels[t];
-            require(lvl.head != 0, "empty level");
 
             uint256 price = priceAtTick(t);
 
@@ -381,18 +379,22 @@ contract SimpleLotrade {
                 spent += pay;
                 require(spent <= maxTetcIn, "slippage");
 
-                // // Taker delivers TETC to maker (seller)
-                // TETC.safeTransferFrom(msg.sender, m.owner, pay);
-
-                // // Contract releases escrowed TKN10K to taker
-                // TKN10K.safeTransfer(msg.sender, f);
-
                 // Update balances
                 m.lotsRemaining -= f;
+                m.valueRemaining -= pay;
+
                 lvl.totalLots -= f;
                 bookEscrowTKN10K -= f;
+                lvl.totalValue -= pay;
+                bookAskTETC -= pay;
 
                 remain -= f;
+
+                // Contract delivers TETC to maker (seller) AFTER state updates
+                TETC.safeTransfer(m.owner, pay);
+
+                // Contract releases escrowed TKN10K to taker AFTER state updates
+                TKN10K.safeTransfer(msg.sender, f);
 
                 _emitTrade(oid, msg.sender, m.owner, true, t, price, f, pay, m.lotsRemaining, m.valueRemaining);
 
@@ -414,28 +416,26 @@ contract SimpleLotrade {
 
         require(remain == 0, "unfilled");
 
-        lastradeTick = lastFilledTick;
-        lastradeBlock = block.number;
+        lastTradeTick = lastFilledTick;
+        lastTradeBlock = block.number;
     }
 
     function takeSellFOK(int256 limitTick, uint256 lots, uint256 minTetcOut) external nonReentrant {
+        require(lots > 0, "You requested zero lots");
         require(bestBuyTick != NONE, "There are no buy orders on book");
         require(minTetcOut <= bookEscrowTETC, "insufficient buy orders on book");
-        require(bestBuyTick >= limitTick, "limit sell too high");
-        require(lots > 0, "zero lots");
 
-        TKN10K.safeTransferFrom(msg.sender, address(this), lots); // escrow TKN10K
+        TKN10K.safeTransferFrom(msg.sender, address(this), lots); // escrow TKN10K. reverts on insufficient balance/allowance
 
         uint256 remain = lots;
         uint256 got = 0;
 
         int256 t = bestBuyTick;
-        int256 lastFilledTick;
+        int256 lastFilledTick;     // internal tracking, see lastTradeTick for global
 
         while (remain > 0) {
             require(t >= limitTick, "FOK");
             TickLevel storage lvl = buyLevels[t];
-            require(lvl.head != 0, "empty level");
 
             uint256 price = priceAtTick(t);
 
@@ -449,19 +449,23 @@ contract SimpleLotrade {
                 uint256 receiveAmt = f * price;
                 got += receiveAmt;
 
-                // // Taker delivers TKN10K to maker (buyer)
-                // TKN10K.safeTransferFrom(msg.sender, m.owner, f);
-
-                // // Contract releases escrowed TETC to taker
-                // TETC.safeTransfer(msg.sender, receiveAmt);
-
                 // Update balances
                 m.lotsRemaining -= f;
+                m.valueRemaining -= receiveAmt;
+
                 lvl.totalLots -= f;
+                bookAskTKN10K -= f;
                 lvl.totalValue -= receiveAmt;
                 bookEscrowTETC -= receiveAmt;
 
                 remain -= f;
+
+                // Contract delivers TKN10K to maker (buyer) AFTER state updates
+                TKN10K.safeTransfer(m.owner, f);
+
+                // Contract releases escrowed TETC to taker AFTER state updates
+                TETC.safeTransfer(msg.sender, receiveAmt);
+                
 
                 _emitTrade(oid, msg.sender, m.owner, false, t, price, f, receiveAmt, m.lotsRemaining, m.valueRemaining);
 
@@ -482,10 +486,12 @@ contract SimpleLotrade {
         }
 
         require(remain == 0, "unfilled");
+
+        // Slippage guard: total quote received cannot be less than minTetcOut
         require(got >= minTetcOut, "slippage");
 
-        lastradeTick = lastFilledTick;
-        lastradeBlock = block.number;
+        lastTradeTick = lastFilledTick;
+        lastTradeBlock = block.number;
     }
 
     /* -------------------- Internals: Orders / Levels -------------------- */
@@ -685,7 +691,7 @@ contract SimpleLotrade {
     }
 
     function getOracle() external view returns (int256, int256, int256, uint256) {
-        return (bestBuyTick, bestSellTick, lastradeTick, lastradeBlock);
+        return (bestBuyTick, bestSellTick, lastTradeTick, lastTradeBlock);
     }
 
     function getEscrowTotals() external view returns (uint256 buyTETC, uint256 sellTKN10K) {
