@@ -135,6 +135,15 @@ contract SimpleLotrade {
         uint256 orderCount;
     }
 
+    struct BookOrder {
+        uint256 id;
+        address owner;
+        int256 tick;
+        uint256 price;
+        uint256 lotsRemaining;
+        uint256 valueRemaining;
+    }
+
     // Packed mantissa bytes (464 uint16, big-endian, 2 bytes each)
     bytes internal constant MANT =
         hex"03e803ed03f203f703fc04010406040b04100416041b04200425042b04300435"
@@ -642,6 +651,16 @@ contract SimpleLotrade {
         return getBook(false, maxLevels);
     }
 
+    function getBuyOrders(uint256 maxOrders) external view returns (BookOrder[] memory out, uint256 n)
+    {
+        return getOrders(true, maxOrders);
+    }
+
+    function getSellOrders(uint256 maxOrders) external view returns (BookOrder[] memory out, uint256 n)
+    {
+        return getOrders(false, maxOrders);
+    }
+
     function getBook(bool isBuy, uint256 maxLevels)
         internal
         view
@@ -672,6 +691,36 @@ contract SimpleLotrade {
                 if (lvl.totalLots > 0) out[n++] = BookLevel(t, lvl.price, lvl.totalLots, lvl.totalValue, lvl.orderCount);
                 t = lvl.next;
             }
+        }
+    }
+
+    function getOrders(bool isBuy, uint256 maxOrders)
+        internal
+        view
+        returns (BookOrder[] memory out, uint256 n)
+    {
+        if (maxOrders == 0) return (new BookOrder[](0), 0);
+
+        int256 t = isBuy ? bestBuyTick : bestSellTick;
+        if (t == NONE) return (new BookOrder[](0), 0);
+
+        out = new BookOrder[](maxOrders);
+        n = 0;
+
+        while (t != NONE && n < maxOrders) {
+            TickLevel storage lvl = isBuy ? buyLevels[t] : sellLevels[t];
+            uint256 id = lvl.head;
+            uint256 price = lvl.price;
+
+            while (id != 0 && n < maxOrders) {
+                Order storage o = orders[id];
+                if (o.lotsRemaining > 0) {
+                    out[n++] = BookOrder(id, o.owner, t, price, o.lotsRemaining, o.valueRemaining);
+                }
+                id = o.next;
+            }
+
+            t = lvl.next;
         }
     }
 

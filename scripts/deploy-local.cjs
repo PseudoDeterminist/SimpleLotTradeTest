@@ -1,4 +1,56 @@
+const fs = require("fs");
+const path = require("path");
 const { ethers } = require("hardhat");
+
+const ROOT = path.join(__dirname, "..");
+const ENV_PATH = path.join(ROOT, ".env");
+const UI_CONFIG_PATH = path.join(ROOT, "ui", "config.js");
+
+function updateEnvFile(filePath, entries) {
+  let lines = [];
+  if (fs.existsSync(filePath)) {
+    lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+  }
+  const used = new Set();
+  const next = lines.map((line) => {
+    for (const [key, value] of Object.entries(entries)) {
+      if (line.startsWith(`${key}=`)) {
+        used.add(key);
+        return `${key}=${value}`;
+      }
+    }
+    return line;
+  });
+  for (const [key, value] of Object.entries(entries)) {
+    if (!used.has(key)) next.push(`${key}=${value}`);
+  }
+  let last = next.length - 1;
+  while (last >= 0 && next[last] === "") last -= 1;
+  const output = last >= 0 ? `${next.slice(0, last + 1).join("\n")}\n` : "";
+  fs.writeFileSync(filePath, output);
+}
+
+function updateUiConfig(filePath, entries) {
+  if (!fs.existsSync(filePath)) return;
+  let text = fs.readFileSync(filePath, "utf8");
+  const mapping = {
+    tetcAddress: entries.TETC_ADDRESS,
+    tkn10kAddress: entries.TKN10K_ADDRESS,
+    simpleLotTradeAddress: entries.SIMPLE_LOT_TRADE_ADDRESS
+  };
+  for (const [key, value] of Object.entries(mapping)) {
+    const re = new RegExp(`${key}:\\s*\"[^\"]*\"`);
+    if (re.test(text)) {
+      text = text.replace(re, `${key}: \"${value}\"`);
+    }
+  }
+  fs.writeFileSync(filePath, text);
+}
+
+function writeAddresses(entries) {
+  updateEnvFile(ENV_PATH, entries);
+  updateUiConfig(UI_CONFIG_PATH, entries);
+}
 
 async function main() {
   const [deployer] = await ethers.getSigners();
@@ -39,6 +91,14 @@ async function main() {
   const clob = await SimpleLotTrade.deploy(tetc.target, tkn10k.target);
   await waitForReceipt(clob.deploymentTransaction(), "SimpleLotTrade deploy");
   console.log("SimpleLotTrade:", clob.target);
+
+  const addresses = {
+    TETC_ADDRESS: tetc.target,
+    TKN10K_ADDRESS: tkn10k.target,
+    SIMPLE_LOT_TRADE_ADDRESS: clob.target
+  };
+  writeAddresses(addresses);
+  console.log("Saved addresses to .env and ui/config.js");
 }
 
 main().catch((err) => {
